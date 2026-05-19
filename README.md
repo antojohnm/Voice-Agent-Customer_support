@@ -1,10 +1,10 @@
-# 🤖 AI Call Centre
+# AI Call Centre
 
 An intelligent, voice-based customer support system that handles real phone calls using AI. Customers can call a real phone number, speak naturally, and get accurate responses about their orders, promotions, return policies, warranties, and store information — all powered by a live database.
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [Overview](#overview)
 - [Architecture](#architecture)
