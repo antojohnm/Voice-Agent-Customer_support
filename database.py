@@ -212,6 +212,45 @@ def store_llm_response(call_sid: str, transcript: str, response: str):
     redis_client.expire(f"responses:{call_sid}", REDIS_TTL)
     print(f"[{call_sid}] Lazily cached response for intent: '{intent}'")
 
+def verify_customer_phone(
+    order_id,
+    caller_number
+):
+    """
+    Verify that the incoming caller owns
+    the requested order.
+    """
+
+    conn = get_connection()
+
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT c.phone
+            FROM orders o
+            JOIN customers c
+                ON o.customer_id = c.customer_id
+            WHERE o.order_id = %s
+            """,
+            (order_id,)
+        )
+
+        row = cursor.fetchone()
+
+        cursor.close()
+
+        if not row:
+            return False
+
+        registered_phone = str(row[0]).strip()
+        caller_number = str(caller_number).strip()
+
+        return registered_phone == caller_number
+
+    finally:
+        conn.close()
 
 def get_order_context_cached(order_id: int, call_sid: str):
     """
@@ -405,7 +444,7 @@ def get_product_offers(product_name: str = None, category: str = None):
         prod_name, cat, price, offer, discount, end_date = row
         lines.append(
             f"  - {prod_name} ({cat}): {offer} — "
-            f"{discount}% off | Valid until {end_date.strftime('%B %d, %Y')}"
+            f"₹{discount} off | Valid until {end_date.strftime('%B %d, %Y')}"
         )
     return "\n".join(lines)
 
@@ -519,6 +558,66 @@ def get_store_info(city: str = None):
         )
     return "\n".join(lines)
 
+def get_product_categories():
+    """
+    Fetch all available product categories and their products.
+    Cached globally in Redis for 30 minutes.
+    """
+    cache_key = "global:product_categories"
+    CATEGORIES_CACHE_TTL = 1800
+
+    # Check Redis first
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            print("Product categories served from Redis cache")
+            return cached
+    except Exception as e:
+        print(f"Redis unavailable for categories: {e}")
+
+    # Cache miss — query database
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT category,
+               string_agg(product_name, ', ' ORDER BY product_name) AS products
+        FROM product_catalog
+        WHERE stock_available = true
+        GROUP BY category
+        ORDER BY category
+    """)
+
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if not rows:
+        return ""
+
+    lines = ["CATEGORIES AND PRODUCTS WE CURRENTLY CARRY:"]
+    for category, products in rows:
+        lines.append(f"- {category}: {products}")
+
+    result = "\n".join(lines)
+
+    # Store in Redis
+    try:
+        redis_client.setex(cache_key, CATEGORIES_CACHE_TTL, result)
+        print("Product categories cached in Redis for 30 minutes")
+    except Exception as e:
+        print(f"Could not cache categories: {e}")
+
+    return result
+
+
+def invalidate_categories_cache():
+    """Call this whenever products are added or updated."""
+    try:
+        redis_client.delete("global:product_categories")
+        print("Product categories cache invalidated")
+    except Exception as e:
+        print(f"Could not invalidate cache: {e}")
 
 def get_conversation_history(call_sid):
     conn = get_connection()
