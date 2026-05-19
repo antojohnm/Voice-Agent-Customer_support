@@ -274,34 +274,17 @@ Copy the `https://` forwarding URL — you'll need it for Twilio configuration.
 Create a `.env` file with the following:
 
 ```env
-# Groq (Primary LLM + Whisper STT)
-GROQ_API_KEY=gsk_your_groq_key
-
-# OpenAI (Fallback LLM)
-OPENAI_API_KEY=sk_your_openai_key
-
-# ElevenLabs (Primary TTS)
-ELEVENLABS_API_KEY=your_elevenlabs_key
-
-# Twilio (Phone infrastructure)
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_PHONE_NUMBER=+1xxxxxxxxxx
-
-# Human agent number (fallback when both LLMs fail)
+TWILIO_ACCOUNT_SID=your_twilio_account_sid
+TWILIO_AUTH_TOKEN=your_twilio_auth_token
+ELEVENLABS_API_KEY=your_elevenlabs_api_key
+GROQ_API_KEY=your_groq_api_key
+DEEPGRAM_API_KEY=your_deepgram_api_key
 HUMAN_AGENT_NUMBER=+91xxxxxxxxxx
-
-# PostgreSQL
 DB_HOST=localhost
-DB_PORT=5433
+DB_PORT=5432
 DB_NAME=call_centre
 DB_USER=postgres
-DB_PASSWORD=your_password
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
+DB_PASSWORD=your_db_password
 ```
 
 > **Never commit your `.env` file to GitHub.**
