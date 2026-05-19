@@ -15,6 +15,7 @@ from database import (
     set_call_state, get_call_state, update_call_state, delete_call_state,
     get_cached_response, store_llm_response,
     get_order_context_cached,
+    verify_customer_phone,
     redis_client
 )
 import os
@@ -70,18 +71,21 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-current_audio_file = None
+current_audio_files = {}
+
+# ── Per-call active process_transcript tasks ──
+# Used to cancel in-progress responses when customer interrupts
+active_tasks = {}  # call_sid → asyncio.Task
 
 
 # ════════════════════════════════════════════════════
-# Dead call monitor — runs as background task
-# Cleans up calls that went silent without a proper hangup
+# Dead call monitor
 # ════════════════════════════════════════════════════
 
 async def monitor_dead_calls():
     """Background task — detects and cleans up silent/dead calls."""
     while True:
-        await asyncio.sleep(30)  # check every 30 seconds
+        await asyncio.sleep(30)
         try:
             keys = redis_client.keys("call:*")
             for key in keys:
@@ -90,7 +94,7 @@ async def monitor_dead_calls():
                 if last_activity == 0:
                     continue
                 elapsed = time.time() - last_activity
-                if elapsed > 120:  # 2 minutes of silence
+                if elapsed > 120:
                     print(f"[{call_sid}] Dead call detected ({elapsed:.0f}s inactive) — cleaning up")
                     end_call(call_sid)
                     delete_call_state(call_sid)
@@ -114,15 +118,15 @@ def format_numbers_for_speech(text):
     return re.sub(r'\b\d{4,}\b', space_digits, text)
 
 
-def generate_elevenlabs_audio(text):
+def generate_elevenlabs_audio(text, call_sid):
     """Generate audio using ElevenLabs. Returns None if quota exceeded."""
     from elevenlabs.client import ElevenLabs
-    global current_audio_file
 
     text = format_numbers_for_speech(text)
 
     try:
         client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+
         audio = client.text_to_speech.convert(
             text=text,
             voice_id="EXAVITQu4vr4xnSDxMaL",
@@ -130,18 +134,23 @@ def generate_elevenlabs_audio(text):
             output_format="mp3_44100_128"
         )
 
-        if current_audio_file and os.path.exists(current_audio_file):
-            os.unlink(current_audio_file)
+        old_file = current_audio_files.get(call_sid)
+        if old_file and os.path.exists(old_file):
+            os.unlink(old_file)
 
         temp = tempfile.NamedTemporaryFile(
-            suffix=".mp3", delete=False, dir=".", prefix="response_"
+            suffix=".mp3",
+            delete=False,
+            dir=".",
+            prefix=f"response_{call_sid}_"
         )
+
         for chunk in audio:
             if chunk:
                 temp.write(chunk)
-        temp.close()
 
-        current_audio_file = temp.name
+        temp.close()
+        current_audio_files[call_sid] = temp.name
         return temp.name
 
     except Exception as e:
@@ -149,9 +158,9 @@ def generate_elevenlabs_audio(text):
         return None
 
 
-def get_play_block(text, host):
+def get_play_block(text, host, call_sid):
     """Try ElevenLabs first, fall back to Twilio Polly TTS."""
-    audio_path = generate_elevenlabs_audio(text)
+    audio_path = generate_elevenlabs_audio(text, call_sid)
 
     if audio_path:
         audio_filename = os.path.basename(audio_path)
@@ -190,7 +199,7 @@ def build_transfer_twiml(host, call_sid):
 
 
 def build_response_twiml(text, host, call_sid, verified=False):
-    play_block = get_play_block(text, host)
+    play_block = get_play_block(text, host, call_sid)
 
     if verified:
         gather = f"""<Gather input="speech"
@@ -228,7 +237,7 @@ async def process_transcript(call_sid: str, transcript: str, host: str):
     2. Check Redis cache for keyword match → instant response
     3. Cache miss → call Groq LLM → store response in Redis
     4. Play response back via Twilio REST API
-    5. Unmute after TTS finishes
+    5. Unmute after TTS finishes (unless interrupted)
     """
     from twilio.rest import Client as TwilioClient
 
@@ -236,6 +245,9 @@ async def process_transcript(call_sid: str, transcript: str, host: str):
 
     # Update last activity timestamp
     update_call_state(call_sid, is_speaking=True, last_activity_at=time.time())
+
+    # Clear any previous interrupt flag
+    redis_client.hset(f"call:{call_sid}", "is_interrupted", "0")
 
     # Goodbye detection
     goodbye_words = ["goodbye", "bye", "thank you", "thanks", "that's all"]
@@ -246,41 +258,87 @@ async def process_transcript(call_sid: str, transcript: str, host: str):
     response_text = get_cached_response(call_sid, transcript)
 
     if response_text:
-        # Cache hit — save messages manually since chat() won't be called
         from database import save_message
         save_message(call_sid, "user", transcript)
         save_message(call_sid, "assistant", response_text)
     else:
-        # ── Step 2: Cache miss — call LLM ──
-        # chat() handles save_message internally
         print(f"[{call_sid}] Cache miss — sending to LLM")
         response_text = chat(transcript, call_sid=call_sid)
 
-        # Store LLM response in Redis for future reuse
+        # ── NEW: LLM requested human escalation ──
+        if "TRANSFER_TO_HUMAN" in str(response_text):
+            print(f"[{call_sid}] HUMAN ESCALATION TRIGGERED")
+
+            transfer_number = os.getenv("HUMAN_AGENT_NUMBER")
+            print(f"[{call_sid}] Target number: {transfer_number}")
+
+            twiml = build_transfer_twiml(host, call_sid)
+
+            print(f"[{call_sid}] Transfer TwiML:")
+            print(twiml)
+
+            try:
+                twilio_client = TwilioClient(
+                    os.getenv("TWILIO_ACCOUNT_SID"),
+                    os.getenv("TWILIO_AUTH_TOKEN")
+                )
+
+                result = twilio_client.calls(call_sid).update(
+                    twiml=twiml
+                )
+
+                print(f"[{call_sid}] Transfer successful: {result.sid}")
+
+            except Exception as e:
+                print(f"[{call_sid}] Transfer failed: {e}")
+
+            return
+
         if response_text:
             store_llm_response(call_sid, transcript, response_text)
 
     # ── Step 3: LLM failed — transfer to human ──
+    # ── Step 3: LLM failed — transfer to human ──
     if not response_text:
-        print(f"[{call_sid}] LLM failed — transferring to human agent")
+        print(f"[{call_sid}] TRANSFER TRIGGERED")
+
+        transfer_number = os.getenv("HUMAN_AGENT_NUMBER")
+        print(f"[{call_sid}] Target number: {transfer_number}")
+
         twiml = build_transfer_twiml(host, call_sid)
+        print(f"[{call_sid}] Transfer TwiML:\n{twiml}")
+
         try:
             twilio_client = TwilioClient(
                 os.getenv("TWILIO_ACCOUNT_SID"),
                 os.getenv("TWILIO_AUTH_TOKEN")
             )
-            twilio_client.calls(call_sid).update(twiml=twiml)
+
+            result = twilio_client.calls(call_sid).update(
+                twiml=twiml
+            )
+
+            print(f"[{call_sid}] Twilio update successful: {result.sid}")
+
         except Exception as e:
-            print(f"[{call_sid}] Failed to update call: {e}")
+            print(f"[{call_sid}] TRANSFER FAILED: {e}")
+
+        return
+
+    # ── Check if interrupted before even playing ──
+    interrupted = redis_client.hget(f"call:{call_sid}", "is_interrupted") == "1"
+    if interrupted:
+        print(f"[{call_sid}] Interrupted before playback — discarding response")
+        update_call_state(call_sid, is_speaking=False, resumed_at=time.time())
         return
 
     print(f"[{call_sid}] Agent: {response_text}")
-    play_block = get_play_block(response_text, host)
+    play_block = get_play_block(response_text, host, call_sid)
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     {play_block}
-    <Pause length="30"/>
+    <Pause length="60"/>
 </Response>"""
 
     try:
@@ -292,29 +350,61 @@ async def process_transcript(call_sid: str, transcript: str, host: str):
         print(f"[{call_sid}] Response playing")
     except Exception as e:
         print(f"[{call_sid}] Failed to update call TwiML: {e}")
+        return
 
-    # Wait for TTS to finish
-    audio_path = None
-    if current_audio_file and os.path.exists(current_audio_file):
-        audio_path = current_audio_file
-
-    if audio_path:
+    # ── Wait for TTS to finish — checking for interrupts ──
+    audio_path = current_audio_files.get(call_sid)
+    if audio_path and os.path.exists(audio_path):
         try:
-            
             audio = MP3(audio_path)
             actual_duration = audio.info.length
             print(f"[{call_sid}] TTS duration: {actual_duration:.1f}s")
-            await asyncio.sleep(actual_duration + 0.2)
+            total_duration = actual_duration + 0.2
         except Exception:
-            estimated_duration = max(2, len(response_text.split()) * 0.4)
-            await asyncio.sleep(estimated_duration)
+            total_duration = max(2, len(response_text.split()) * 0.4)
     else:
         word_count = len(response_text.split())
-        estimated_duration = max(1.5, (word_count / 150) * 60)
-        print(f"[{call_sid}] Estimated TTS duration: {estimated_duration:.1f}s ({word_count} words)")
-        await asyncio.sleep(estimated_duration)
+        total_duration = max(1.5, (word_count / 150) * 60)
+        print(f"[{call_sid}] Estimated TTS duration: {total_duration:.1f}s ({word_count} words)")
 
-    # Unmute — resume listening
+    # Check for interrupt every 0.3 seconds instead of sleeping full duration
+    elapsed = 0.0
+    check_interval = 0.3
+    while elapsed < total_duration:
+        await asyncio.sleep(check_interval)
+        elapsed += check_interval
+
+        # Check if customer interrupted
+        interrupted = redis_client.hget(f"call:{call_sid}", "is_interrupted") == "1"
+        if interrupted:
+            print(f"[{call_sid}] Interrupt detected at {elapsed:.1f}s — stopping TTS")
+            # Send silence TwiML to stop audio immediately
+            try:
+                stop_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="60"/>
+</Response>"""
+                twilio_client = TwilioClient(
+                    os.getenv("TWILIO_ACCOUNT_SID"),
+                    os.getenv("TWILIO_AUTH_TOKEN")
+                )
+                twilio_client.calls(call_sid).update(twiml=stop_twiml)
+                print(f"[{call_sid}] TTS stopped — ready for customer input")
+            except Exception as e:
+                print(f"[{call_sid}] Failed to stop TTS: {e}")
+
+            # Unmute immediately so customer's speech is processed
+            update_call_state(
+                call_sid,
+                is_speaking=False,
+                resumed_at=time.time(),
+                last_activity_at=time.time()
+            )
+            redis_client.hset(f"call:{call_sid}", "is_interrupted", "0")
+            print(f"[{call_sid}] Listening resumed after interrupt")
+            return
+
+    # TTS finished naturally — unmute
     update_call_state(
         call_sid,
         is_speaking=False,
@@ -328,6 +418,26 @@ async def process_transcript(call_sid: str, transcript: str, host: str):
 # Call routes
 # ════════════════════════════════════════════════════
 
+async def unmute_after_greeting(call_sid: str, duration: float):
+    """Wait for greeting to finish playing then unmute Deepgram."""
+    total_wait = 2.0 + duration + 0.3
+    print(f"[{call_sid}] Unmuting in {total_wait:.1f}s")
+    await asyncio.sleep(total_wait)
+
+    state = get_call_state(call_sid)
+    if not state:
+        print(f"[{call_sid}] Call ended before unmute")
+        return
+
+    update_call_state(
+        call_sid,
+        is_speaking=False,
+        resumed_at=time.time(),
+        last_activity_at=time.time()
+    )
+    print(f"[{call_sid}] Greeting finished — listening started")
+
+
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     host = request.headers.get("host")
@@ -339,17 +449,15 @@ async def incoming_call(request: Request):
     print(f"Incoming call! SID: {call_sid} From: {caller_number}")
     start_call(call_sid, caller_number)
 
-    # Set call state immediately so Deepgram stream can find it
-    set_call_state(call_sid, is_speaking=True, host=host)
+    redis_client.setex(f"caller:{call_sid}", 900, caller_number)
 
     greeting = (
         "Hello! Thank you for calling. "
         "I'm Maya, your customer support agent. "
         "How can I help you today?"
     )
-    play_block = get_play_block(greeting, host)
+    play_block = get_play_block(greeting, host, call_sid)
 
-    # Start recording
     try:
         from twilio.rest import Client as TwilioClient
         twilio_client = TwilioClient(
@@ -364,7 +472,23 @@ async def incoming_call(request: Request):
     except Exception as e:
         print(f"[{call_sid}] Could not start recording: {e}")
 
-    # Play greeting then open Deepgram stream for full conversation
+    set_call_state(call_sid, is_speaking=True, host=host)
+
+    word_count = len(greeting.split())
+    greeting_audio = current_audio_files.get(call_sid)
+
+    if greeting_audio and os.path.exists(greeting_audio):
+        try:
+            audio = MP3(greeting_audio)
+            greeting_duration = audio.info.length + 0.5
+        except Exception:
+            greeting_duration = max(2.0, word_count / 3.5)
+    else:
+        greeting_duration = max(2.0, word_count / 3.5)
+
+    print(f"[{call_sid}] Greeting duration: {greeting_duration:.1f}s — will unmute after")
+    asyncio.create_task(unmute_after_greeting(call_sid, greeting_duration))
+
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Pause length="2"/>
@@ -374,10 +498,11 @@ async def incoming_call(request: Request):
             <Parameter name="call_sid" value="{call_sid}"/>
         </Stream>
     </Start>
-    <Pause length="30"/>
+    <Pause length="60"/>
 </Response>"""
 
     return Response(content=twiml, media_type="text/xml")
+
 
 @app.post("/handle-order-id")
 async def handle_order_id(request: Request, call_sid: str = ""):
@@ -392,12 +517,10 @@ async def handle_order_id(request: Request, call_sid: str = ""):
     digits = form_data.get("Digits", "").strip()
     speech = form_data.get("SpeechResult", "").strip()
 
-    # ── DTMF input — reliable, skip confirmation ──
     if digits:
         print(f"[{call_sid}] Order ID via keypad: {digits}")
         return await process_order_id(digits, call_sid, host)
 
-    # ── Speech input — convert and confirm ──
     if speech:
         order_id_str = spoken_to_order_id(speech)
 
@@ -405,18 +528,12 @@ async def handle_order_id(request: Request, call_sid: str = ""):
             return await ask_again(call_sid, host, attempt, f"I heard {order_id_str or 'nothing'} which doesnt look like a valid 4 digit order ID")
         print(f"[{call_sid}] Speech: '{speech}' → Order ID: '{order_id_str}'")
 
-        if not order_id_str:
-            return await ask_again(call_sid, host, attempt, "couldn't understand that")
-
-        # Store pending order ID in Redis temporarily
         redis_client.setex(f"pending_order:{call_sid}", 300, order_id_str)
 
-        # Read back digit by digit for confirmation
         spaced = ' '.join(list(order_id_str))
         confirm_text = f"I heard order ID {spaced}. Is that correct? Say yes to confirm or no to try again."
-        play_block = get_play_block(confirm_text, host)
+        play_block = get_play_block(confirm_text, host, call_sid)
 
-        
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech"
@@ -433,7 +550,6 @@ async def handle_order_id(request: Request, call_sid: str = ""):
 </Response>"""
         return Response(content=twiml, media_type="text/xml")
 
-    # ── No input ──
     return await ask_again(call_sid, host, attempt, "didn't receive any input")
 
 
@@ -441,7 +557,7 @@ async def ask_again(call_sid: str, host: str, attempt: int, reason: str):
     """Ask caller to retry or switch to keypad after 2 failed speech attempts."""
     if attempt >= 3:
         text = "No problem. Please type your Order ID on the keypad and press the hash key."
-        play_block = get_play_block(text, host)
+        play_block = get_play_block(text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="dtmf"
@@ -456,7 +572,7 @@ async def ask_again(call_sid: str, host: str, attempt: int, reason: str):
     else:
         next_attempt = attempt + 1
         text = f"Sorry, I {reason}. Please say your Order ID again, digit by digit."
-        play_block = get_play_block(text, host)
+        play_block = get_play_block(text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech dtmf"
@@ -476,6 +592,13 @@ async def ask_again(call_sid: str, host: str, attempt: int, reason: str):
 
 async def process_order_id(order_id_str: str, call_sid: str, host: str):
     """Process a confirmed order ID — verify, seed Redis, open Deepgram stream."""
+    caller_number = redis_client.get(f"caller:{call_sid}")
+
+    if not verify_customer_phone(int(order_id_str), caller_number):
+        print(f"[{call_sid}] Phone verification failed")
+        twiml = build_transfer_twiml(host, call_sid)
+        return Response(content=twiml, media_type="text/xml")
+
     response_text = chat(order_id_str, call_sid=call_sid)
     print(f"[{call_sid}] Agent: {response_text}")
 
@@ -487,7 +610,7 @@ async def process_order_id(order_id_str: str, call_sid: str, host: str):
         order_id = get_verified_order(call_sid)
         get_order_context_cached(int(order_id), call_sid)
 
-        play_block = get_play_block(response_text, host)
+        play_block = get_play_block(response_text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     {play_block}
@@ -496,7 +619,7 @@ async def process_order_id(order_id_str: str, call_sid: str, host: str):
             <Parameter name="call_sid" value="{call_sid}"/>
         </Stream>
     </Start>
-    <Pause length="30"/>
+    <Pause length="60"/>
 </Response>"""
     else:
         twiml = build_response_twiml(response_text, host, call_sid, verified=False)
@@ -511,14 +634,14 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
     if not call_sid:
         call_sid = request.query_params.get("call_sid", "unknown")
 
-    # Read attempt FIRST before anything else
     attempt = int(request.query_params.get("attempt", "1"))
     timeout = request.query_params.get("timeout", "false")
+
     if timeout == "true":
         order_id_str = redis_client.get(f"pending_order:{call_sid}") or "unknown"
         spaced = ' '.join(list(order_id_str))
         confirm_text = f"I didn't hear a response. Did you say order ID {spaced}? Please say yes or no."
-        play_block = get_play_block(confirm_text, host)
+        play_block = get_play_block(confirm_text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech"
@@ -528,7 +651,7 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
             timeout="15"
             language="en-IN"
             speechModel="phone_call"
-            hints="yes:5, no:5, yeah:5, nope:5">
+            hints="yes, no, yeah, nope">
         {play_block}
     </Gather>
     <Redirect method="POST">https://{host}/confirm-order-id?call_sid={call_sid}&amp;attempt={attempt}&amp;timeout=true</Redirect>
@@ -543,8 +666,6 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
 
     confirmed = any(word in speech for word in yes_words)
     denied    = any(word in speech for word in no_words)
-
-
 
     if confirmed:
         order_id_str = redis_client.get(f"pending_order:{call_sid}")
@@ -561,11 +682,10 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
         return await ask_again(call_sid, host, attempt, "let's try again")
 
     else:
-        # Unclear — ask to confirm again
         order_id_str = redis_client.get(f"pending_order:{call_sid}") or "unknown"
         spaced = ' '.join(list(order_id_str))
         confirm_text = f"Sorry, I didn't catch that. Did you say order ID {spaced}? Please say yes or no."
-        play_block = get_play_block(confirm_text, host)
+        play_block = get_play_block(confirm_text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech"
@@ -579,7 +699,6 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
     </Gather>
 </Response>"""
         return Response(content=twiml, media_type="text/xml")
-   
 
 
 # ════════════════════════════════════════════════════
@@ -589,7 +708,7 @@ async def confirm_order_id(request: Request, call_sid: str = ""):
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    Twilio Media Stream → Deepgram live STT
+    Twilio Media Stream → Deepgram live STT with interrupt support.
     Falls back to Twilio STT if Deepgram fails.
     """
     await websocket.accept()
@@ -598,7 +717,6 @@ async def media_stream(websocket: WebSocket):
     host = ""
     print(f"[unknown] Media stream connected — waiting for start event")
 
-    # Read call_sid from Twilio's start event
     async for message in websocket.iter_text():
         data = json.loads(message)
         if data.get("event") == "start":
@@ -618,24 +736,66 @@ async def media_stream(websocket: WebSocket):
         async def on_transcript(self, result, **kwargs):
             try:
                 sentence = result.channel.alternatives[0].transcript
-                if not sentence or not result.is_final:
+                is_final = result.is_final
+
+                if not sentence:
                     return
 
-                # Read state from Redis
                 state = get_call_state(call_sid)
+                is_speaking = state.get("is_speaking", False)
 
-                # Option A muting — ignore while agent is speaking
-                if state.get("is_speaking", False):
+                # ── Interrupt detection ──
+                # If agent is speaking and we get an interim result
+                # with at least 2 words → treat as interrupt
+                if is_speaking and not is_final:
+                    word_count = len(sentence.strip().split())
+                    if word_count >= 2:
+                        print(f"[{call_sid}] Interrupt detected: '{sentence}'")
+
+                        # Set interrupt flag in Redis
+                        redis_client.hset(f"call:{call_sid}", "is_interrupted", "1")
+
+                        # Cancel active process_transcript task if running
+                        task = active_tasks.get(call_sid)
+                        if task and not task.done():
+                            task.cancel()
+                            active_tasks.pop(call_sid, None)
+                            print(f"[{call_sid}] Active task cancelled")
+
+                        # Immediately unmute
+                        update_call_state(
+                            call_sid,
+                            is_speaking=False,
+                            resumed_at=time.time(),
+                            last_activity_at=time.time()
+                        )
+                    return  # Always return on interim — wait for final
+
+                # ── Final transcript handling ──
+                if not is_final:
+                    return
+
+                # Ignore if still muted (non-interrupt case)
+                if is_speaking:
                     print(f"[{call_sid}] Muted — ignoring: '{sentence}'")
                     return
 
-                # Cooldown — discard buffered audio arriving just after unmute
+                # Cooldown — discard buffered audio just after unmute
                 resumed_at = state.get("resumed_at", 0)
                 if time.time() - resumed_at < 1.0:
                     print(f"[{call_sid}] Cooldown — discarding buffered audio: '{sentence}'")
                     return
 
-                await process_transcript(call_sid, sentence, host)
+                # Cancel any existing task before starting new one
+                existing_task = active_tasks.get(call_sid)
+                if existing_task and not existing_task.done():
+                    existing_task.cancel()
+
+                # Start new process_transcript task and track it
+                task = asyncio.create_task(
+                    process_transcript(call_sid, sentence, host)
+                )
+                active_tasks[call_sid] = task
 
             except Exception as e:
                 print(f"[{call_sid}] Transcript error: {e}")
@@ -652,7 +812,7 @@ async def media_stream(websocket: WebSocket):
             encoding="mulaw",
             sample_rate=8000,
             endpointing=300,
-            interim_results=False,
+            interim_results=True,   # ← CHANGED: needed for interrupt detection
         )
 
         result = await deepgram_ws.start(options)
@@ -703,6 +863,16 @@ async def media_stream(websocket: WebSocket):
     finally:
         if deepgram_connected and deepgram_ws:
             await deepgram_ws.finish()
+
+        # Cancel any active task
+        task = active_tasks.pop(call_sid, None)
+        if task and not task.done():
+            task.cancel()
+
+        audio_path = current_audio_files.pop(call_sid, None)
+        if audio_path and os.path.exists(audio_path):
+            os.unlink(audio_path)
+
         delete_call_state(call_sid)
         print(f"[{call_sid}] Stream cleaned up")
 
@@ -728,7 +898,7 @@ async def handle_speech(
 
     if not final_transcript:
         sorry_text = "Sorry, I didn't catch that. Please say your query again."
-        play_block = get_play_block(sorry_text, host)
+        play_block = get_play_block(sorry_text, host, call_sid)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Gather input="speech"
@@ -747,11 +917,16 @@ async def handle_speech(
     if any(word in final_transcript.lower() for word in goodbye_words):
         end_call(call_sid)
 
-    # Check Redis cache first even in fallback path
     response_text = get_cached_response(call_sid, final_transcript)
 
     if not response_text:
         response_text = chat(final_transcript, call_sid=call_sid)
+
+        # ── NEW: LLM requested transfer ──
+        if response_text == "TRANSFER_TO_HUMAN":
+            twiml = build_transfer_twiml(host, call_sid)
+            return Response(content=twiml, media_type="text/xml")
+
         if response_text:
             store_llm_response(call_sid, final_transcript, response_text)
 
@@ -877,7 +1052,6 @@ async def view_transcript(call_sid: str):
 # ════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Verify Redis is running before starting
     try:
         redis_client.ping()
         print("Redis connected successfully")
