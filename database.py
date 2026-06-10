@@ -248,10 +248,32 @@ def get_connection():
     )
 
 
+def ensure_database():
+    """Create the application database if it does not exist yet."""
+    db_name = os.getenv("DB_NAME", "call_centre")
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname="postgres",
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD")
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+    if not cursor.fetchone():
+        cursor.execute(f'CREATE DATABASE "{db_name}"')
+        print(f"Created database: {db_name}")
+    cursor.close()
+    conn.close()
+
+
 def init_db():
+    ensure_database()
     conn = get_connection()
     cursor = conn.cursor()
 
+    # ── Call tracking tables ──
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS calls (
             id SERIAL PRIMARY KEY,
@@ -283,10 +305,230 @@ def init_db():
         )
     """)
 
+    # ── Business tables (order lookup & LLM context) ──
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            customer_id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT,
+            email TEXT,
+            address TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS product_catalog (
+            product_id SERIAL PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price DECIMAL(10, 2) NOT NULL,
+            stock_available BOOLEAN DEFAULT TRUE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            item_id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES product_catalog(product_id),
+            item_name TEXT NOT NULL,
+            is_available BOOLEAN DEFAULT TRUE,
+            quantity INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+            order_status TEXT NOT NULL,
+            total_amount DECIMAL(10, 2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            order_item_id SERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(order_id),
+            item_id INTEGER NOT NULL REFERENCES inventory(item_id),
+            quantity INTEGER NOT NULL DEFAULT 1,
+            price_at_purchase DECIMAL(10, 2) NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            payment_id SERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(order_id),
+            payment_method TEXT,
+            payment_status TEXT,
+            amount DECIMAL(10, 2),
+            paid_at TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS deliveries (
+            delivery_id SERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(order_id),
+            delivery_status TEXT,
+            delivery_address TEXT,
+            delivered_at TIMESTAMP,
+            expected_delivery_date DATE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS promotions_offers (
+            offer_id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES product_catalog(product_id),
+            offer_name TEXT,
+            discount_value INTEGER,
+            end_date DATE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS return_refund_policies (
+            policy_id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES product_catalog(product_id),
+            return_window_days INTEGER,
+            exchange_allowed BOOLEAN DEFAULT TRUE,
+            policy_description TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS warranty_information (
+            warranty_id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES product_catalog(product_id),
+            warranty_period TEXT,
+            coverage_details TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS store_locations (
+            store_id SERIAL PRIMARY KEY,
+            store_name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            opening_time TIME,
+            closing_time TIME
+        )
+    """)
+
     conn.commit()
+    seed_db(cursor, conn)
     cursor.close()
     conn.close()
     print("PostgreSQL database initialized")
+
+
+def seed_db(cursor, conn):
+    """Insert sample data when business tables are empty (safe to run on every startup)."""
+    cursor.execute("SELECT COUNT(*) FROM orders")
+    if cursor.fetchone()[0] > 0:
+        return
+
+    print("Seeding sample business data...")
+
+    cursor.execute("""
+        INSERT INTO customers (name, phone, email, address) VALUES
+        ('John Doe', '+919876543210', 'john.doe@example.com',
+         '12 Anna Salai, Chennai, Tamil Nadu 600002'),
+        ('Jane Smith', '+919876543211', 'jane.smith@example.com',
+         '45 Bandra West, Mumbai, Maharashtra 400050'),
+        ('Arun Kumar', '+919876543212', 'arun.kumar@example.com',
+         '78 MG Road, Bangalore, Karnataka 560001')
+    """)
+
+    cursor.execute("""
+        INSERT INTO product_catalog (product_name, category, price, stock_available) VALUES
+        ('Wireless Headphones', 'Electronics', 49.99, TRUE),
+        ('Smart Watch Pro', 'Electronics', 199.99, TRUE),
+        ('Cotton T-Shirt', 'Clothing', 24.99, TRUE),
+        ('Running Shoes', 'Footwear', 89.99, TRUE),
+        ('Bluetooth Speaker', 'Electronics', 59.99, TRUE)
+    """)
+
+    cursor.execute("""
+        INSERT INTO inventory (product_id, item_name, is_available, quantity) VALUES
+        (1, 'Wireless Headphones - Black', TRUE, 50),
+        (2, 'Smart Watch Pro - Silver', TRUE, 30),
+        (3, 'Cotton T-Shirt - Blue M', TRUE, 100),
+        (4, 'Running Shoes - Size 9', TRUE, 25),
+        (5, 'Bluetooth Speaker - Portable', TRUE, 40)
+    """)
+
+    cursor.execute("""
+        INSERT INTO orders (order_id, customer_id, order_status, total_amount, created_at) VALUES
+        (1001, 1, 'Shipped', 249.98, '2026-05-01 10:30:00'),
+        (1002, 2, 'Processing', 49.98, '2026-06-03 14:15:00'),
+        (1234, 3, 'Delivered', 89.99, '2026-04-20 09:00:00'),
+        (5678, 1, 'Out for Delivery', 59.99, '2026-06-04 11:00:00')
+    """)
+
+    cursor.execute("""
+        INSERT INTO order_items (order_id, item_id, quantity, price_at_purchase) VALUES
+        (1001, 1, 1, 49.99),
+        (1001, 2, 1, 199.99),
+        (1002, 3, 2, 24.99),
+        (1234, 4, 1, 89.99),
+        (5678, 5, 1, 59.99)
+    """)
+
+    cursor.execute("""
+        INSERT INTO payments (order_id, payment_method, payment_status, amount, paid_at) VALUES
+        (1001, 'Credit Card', 'Completed', 249.98, '2026-05-01 10:35:00'),
+        (1002, 'UPI', 'Completed', 49.98, '2026-06-03 14:20:00'),
+        (1234, 'Debit Card', 'Completed', 89.99, '2026-04-20 09:05:00'),
+        (5678, 'Net Banking', 'Completed', 59.99, '2026-06-04 11:05:00')
+    """)
+
+    cursor.execute("""
+        INSERT INTO deliveries (order_id, delivery_status, delivery_address, delivered_at, expected_delivery_date) VALUES
+        (1001, 'In Transit', '12 Anna Salai, Chennai, Tamil Nadu 600002', NULL, '2026-06-08'),
+        (1002, 'Processing', '45 Bandra West, Mumbai, Maharashtra 400050', NULL, '2026-06-10'),
+        (1234, 'Delivered', '78 MG Road, Bangalore, Karnataka 560001', '2026-04-22 16:00:00', '2026-04-25'),
+        (5678, 'Out for Delivery', '12 Anna Salai, Chennai, Tamil Nadu 600002', NULL, '2026-06-06')
+    """)
+
+    cursor.execute("""
+        INSERT INTO promotions_offers (product_id, offer_name, discount_value, end_date) VALUES
+        (1, 'Summer Sale', 15, '2026-08-31'),
+        (2, 'Tech Week Deal', 20, '2026-07-15'),
+        (5, 'Weekend Special', 10, '2026-06-30')
+    """)
+
+    cursor.execute("""
+        INSERT INTO return_refund_policies (product_id, return_window_days, exchange_allowed, policy_description) VALUES
+        (1, 30, TRUE, 'Return in original packaging with receipt for full refund.'),
+        (2, 15, TRUE, 'Exchange only within 15 days for manufacturing defects.'),
+        (3, 7, FALSE, 'No returns on clothing unless item is defective.'),
+        (4, 30, TRUE, 'Free exchange for wrong size within 30 days.'),
+        (5, 30, TRUE, 'Standard 30-day return policy applies.')
+    """)
+
+    cursor.execute("""
+        INSERT INTO warranty_information (product_id, warranty_period, coverage_details) VALUES
+        (1, '1 year', 'Covers manufacturing defects and battery issues.'),
+        (2, '2 years', 'Covers hardware defects; accidental damage not included.'),
+        (3, 'No warranty', 'Standard quality guarantee only.'),
+        (4, '6 months', 'Covers sole separation and stitching defects.'),
+        (5, '1 year', 'Covers speaker and connectivity defects.')
+    """)
+
+    cursor.execute("""
+        INSERT INTO store_locations (store_name, city, opening_time, closing_time) VALUES
+        ('TechMart Express', 'Chennai', '09:00', '21:00'),
+        ('TechMart Express', 'Mumbai', '10:00', '22:00'),
+        ('TechMart Express', 'Bangalore', '09:30', '21:30'),
+        ('TechMart Express', 'Delhi', '10:00', '21:00'),
+        ('TechMart Express', 'Hyderabad', '09:00', '21:00')
+    """)
+
+    conn.commit()
+    print("Sample data seeded. Test order IDs: 1001, 1002, 1234, 5678")
 
 
 def start_call(call_sid, caller_number):
