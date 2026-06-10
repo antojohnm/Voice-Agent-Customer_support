@@ -12,8 +12,11 @@ sounddevice==0.5.5
 tqdm==4.67.3
 twilio==9.10.5
 uvicorn==0.46.0
-websockets==16.0
+websockets>=12.0,<14.0
 psycopg2-binary
 deepgram-sdk==3.7.7
 python-multipart
 aiohttp
+redis
+mutagen
+numpy
